@@ -1,17 +1,24 @@
 # MIX TEST PDFMATCH
 
-Birleşik AHU Match + Test Kontrol Windows masaüstü uygulaması.
+Tek Windows uygulaması içinde **AHU Match (PDF Match)** ve **TEST KONTROL**.
 
-## Mimari
+## Kullanım
+1. Programı açın.
+2. Ana ekrandan **PDF MATCH** veya **TEST KONTROL** seçin.
+3. Seçilen uygulama kendi ekranı ve işlevleriyle açılır.
 
-- `desktop_grouped_app.py`: AHU Match PDF analiz arayüzü
-- `test_kontrol/`: TEST KONTROL arayüzü ve yardımcı modülleri
-- `launcher.py`: İki uygulama işlevine tek pencereden erişim sağlayan başlangıç arayüzü
+## Depo yapısı
+- `pdf_match/`: PDF/AHU/motor eşleştirme uygulaması, testleri ve varlıkları
+- `test_kontrol/`: C600, fan, damper, filtre, modül, sensör ve rapor araçları
+- `launcher.py`: Ana seçim ekranı
+- `unified_updater.py`: Her iki uygulamanın kullandığı tek güncelleme altyapısı
+- `.github/workflows/build-windows.yml`: İki uygulamayı test eden ve tek EXE yayımlayan ortak akış
 
-Mevcut uygulamaların davranışlarını korumak için kodlar ayrı klasörlerde tutulur. Birleşik başlangıç ekranı her iki işlevi de tek paketten açar.
+## Tek EXE ve tek güncelleme
+GitHub Actions iki uygulamanın testlerini çalıştırır, tek `Mix_Test_PDFMatch` EXE'sini üretir ve aynı `latest` GitHub Release'e yayımlar. Ana ekran ve iki modül ortak güncelleme altyapısını kullanır.
 
-## Build
+## Kaynak projeler
+- PDF Match: https://github.com/dincer552/pdf_kw_selector
+- TEST KONTROL: https://github.com/dincer552/test-kontrol-pa
 
-Windows Python 3.11 kullanın. Bağımlılıklar kök `requirements.txt` dosyasında birleştirilir.
-
-> Bu ilk depo iskeletidir. Birleşik EXE üretimi, import yolu uyarlamaları ve regresyon testleri CI üzerinden doğrulanmalıdır.
+Büyük örnek PDF dosyaları API aktarım sınırı nedeniyle bu depoda yinelenmedi; ortak Windows workflow regression testlerinden önce kaynak depodan indirir.

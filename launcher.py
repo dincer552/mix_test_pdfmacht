@@ -84,6 +84,11 @@ def _run_test_kontrol():
             update_button=getattr(self, "_update_button", None),
             status_var=getattr(self, "_mix_status_var", None),
         )
+        TestControlApp._open_update_page = lambda self: common_install(
+            self,
+            update_button=getattr(self, "_update_button", None),
+            status_var=getattr(self, "_mix_status_var", None),
+        )
         TestControlApp().mainloop()
     except Exception as exc:
         messagebox.showerror("TEST KONTROL başlatılamadı", str(exc))

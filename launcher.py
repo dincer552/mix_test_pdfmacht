@@ -6,7 +6,17 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 from mix_meta import BUILD_VERSION
-from unified_updater import check_for_update, install_update
+from unified_updater import check_for_update, install_update, set_exit_callback
+
+SHUTDOWN_REQUESTED = False
+
+
+def _request_shutdown():
+    global SHUTDOWN_REQUESTED
+    SHUTDOWN_REQUESTED = True
+
+
+set_exit_callback(_request_shutdown)
 
 
 def _base_dir() -> Path:
@@ -187,7 +197,7 @@ def _show_home():
 def main():
     # When either child application is closed, return to the choice screen.
     # The loop avoids growing the Python call stack across repeated switches.
-    while True:
+    while not SHUTDOWN_REQUESTED:
         selected = _show_home()
         if selected == "pdf":
             _run_pdf_match()

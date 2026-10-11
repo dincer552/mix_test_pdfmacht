@@ -11,6 +11,14 @@ EXE_ASSET = "Mix_Test_PDFMatch_latest.exe"
 HASH_ASSET = "Mix_Test_PDFMatch_latest.sha256"
 USER_AGENT = "Mix-Test-PDFMatch-Updater/1.0"
 
+_EXIT_CALLBACK = None
+
+
+def set_exit_callback(callback) -> None:
+    """Register the launcher callback that exits the whole process for updates."""
+    global _EXIT_CALLBACK
+    _EXIT_CALLBACK = callback
+
 def _request_json(url):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(req, timeout=12) as response:
@@ -100,8 +108,20 @@ def install_update(parent, update_button=None, status_var=None):
             ps1.write_text("\ufeff" + script, encoding="utf-8")
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
             subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", str(ps1)], creationflags=flags, close_fds=True)
-            try: parent.after(0, parent.destroy)
-            except Exception: pass
+            def close_after_update():
+                if callable(_EXIT_CALLBACK):
+                    try:
+                        _EXIT_CALLBACK()
+                    except Exception:
+                        pass
+                try:
+                    parent.destroy()
+                except Exception:
+                    pass
+            try:
+                parent.after(0, close_after_update)
+            except Exception:
+                pass
         except Exception as exc:
             try:
                 parent.after(0, lambda err=str(exc): messagebox.showerror("Güncelleme", "Güncelleme tamamlanamadı.\n\n" + err, parent=parent))

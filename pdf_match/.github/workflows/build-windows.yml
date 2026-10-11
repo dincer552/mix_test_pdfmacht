@@ -1,0 +1,130 @@
+name: Build Windows Test EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - dincer552-fix-github-updates
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+      - name: Clean stale Python bytecode
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path . -Recurse -Force -Include *.pyc,__pycache__ -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "Stale Python bytecode cleaned."
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller pytest pillow
+      - name: Validate status and GUI source
+        shell: pwsh
+        run: |
+          python -m pytest -q tests/test_status.py
+          python -m py_compile status.py motor_compare.py desktop_app.py desktop_grouped_app.py
+          python -c "import desktop_app; import desktop_grouped_app; import voclean_project_selector; from status import install_status_display; assert hasattr(desktop_grouped_app.GroupedApp, '_build_voclean_tab'); print('Source validation OK')"
+          python -m py_compile coordinate_motor_discovery.py stage2_pdf_discovery.py pdf_master_scan.py desktop_grouped_app.py pdf_hover_indicator.py
+          python -m pytest tests/test_motor_model_matching.py -q
+          python -m pytest tests/test_grouped_tab_counts.py -q
+      - name: Embed build metadata
+        shell: pwsh
+        env:
+          APP_VERSION: v0.5.4.${{ github.run_number }}
+        run: |
+          Set-Content -Path build_info.py -Value @(
+            '"""Build metadata embedded in packaged applications."""'
+            'import pdf_click_opener  # noqa: F401'
+            'import pdf_hover_indicator  # noqa: F401'
+            'import status  # noqa: F401'
+            'import button_label_fix  # noqa: F401'
+            'import voclean_project_selector  # noqa: F401'
+            "BUILD_SHA = `"$env:GITHUB_SHA`""
+            "BUILD_VERSION = `"$env:APP_VERSION`""
+          ) -Encoding UTF8
+          python -c "import build_info; import status; print('Build metadata imports central status renderer')"
+      - name: Build high resolution app icon
+        shell: pwsh
+        run: python build_icon.py
+      - name: Build EXE
+        shell: pwsh
+        env:
+          APP_VERSION: v0.5.4.${{ github.run_number }}
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --icon "AHU_Match.ico" --add-data "AHU_Match.ico;." --additional-hooks-dir=. --collect-all pypdf --name "PDF_KW_Selector_$env:APP_VERSION" desktop_grouped_app.py
+      - name: Smoke test packaged EXE startup
+        shell: pwsh
+        env:
+          APP_VERSION: v0.5.4.${{ github.run_number }}
+        run: |
+          $exe = Join-Path $PWD "dist/PDF_KW_Selector_$env:APP_VERSION.exe"
+          if (-not (Test-Path -LiteralPath $exe)) { throw "Packaged EXE not found: $exe" }
+          Write-Host "Starting packaged EXE smoke test: $exe"
+          $proc = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 12
+          if ($proc.HasExited) { throw "Packaged EXE crashed/exited during startup smoke test. ExitCode=$($proc.ExitCode)" }
+          Write-Host "Packaged EXE stayed running for 12 seconds: startup OK"
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+      - name: Prepare release assets
+        shell: pwsh
+        env:
+          APP_VERSION: v0.5.4.${{ github.run_number }}
+        run: |
+          $source = "dist/PDF_KW_Selector_$env:APP_VERSION.exe"
+          Copy-Item $source dist/PDF_KW_Selector_latest.exe
+          Copy-Item $source "dist/PDF_KW_Selector_$env:GITHUB_SHA.exe"
+          Compress-Archive -Path $source -DestinationPath "dist/PDF_KW_Selector_$env:GITHUB_SHA.zip" -CompressionLevel Optimal
+
+          $chunkSize = 2MB
+          $buffer = New-Object byte[] $chunkSize
+          $inputStream = [System.IO.File]::OpenRead("dist/PDF_KW_Selector_latest.exe")
+          $index = 0
+          try {
+            while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+              $partName = "dist/PDF_KW_Selector_latest.part{0:D3}" -f $index
+              $outputStream = [System.IO.File]::Create($partName)
+              try {
+                $outputStream.Write($buffer, 0, $read)
+              } finally {
+                $outputStream.Dispose()
+              }
+              Write-Host "Created $partName ($read bytes)"
+              $index++
+            }
+          } finally {
+            $inputStream.Dispose()
+          }
+          Write-Host "Created $index update parts (2 MiB maximum)."
+      - name: Publish latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_VERSION: v0.5.4.${{ github.run_number }}
+        shell: bash
+        run: |
+          if gh release view latest >/dev/null 2>&1; then
+            old_parts="$(gh release view latest --json assets --jq '.assets[].name' | grep -E '^PDF_KW_Selector_latest\.part[0-9]{3}$' || true)"
+            while IFS= read -r asset; do
+              [ -z "$asset" ] || gh release delete-asset latest "$asset" --yes || true
+            done <<< "$old_parts"
+
+            gh release upload latest dist/PDF_KW_Selector_latest.exe --clobber
+            gh release upload latest "dist/PDF_KW_Selector_${GITHUB_SHA}.exe" --clobber
+            gh release upload latest "dist/PDF_KW_Selector_${GITHUB_SHA}.zip" --clobber
+            gh release upload latest dist/PDF_KW_Selector_latest.part* --clobber
+            gh release edit latest --title "AHU Match $APP_VERSION - Latest" --notes "Version: $APP_VERSION; Build: $GITHUB_SHA; Updates use 2 MiB GitHub release parts."
+          else
+            gh release create latest dist/PDF_KW_Selector_latest.exe "dist/PDF_KW_Selector_${GITHUB_SHA}.exe" "dist/PDF_KW_Selector_${GITHUB_SHA}.zip" dist/PDF_KW_Selector_latest.part* --target "$GITHUB_SHA" --title "AHU Match $APP_VERSION - Latest" --notes "Version: $APP_VERSION; Build: $GITHUB_SHA; Updates use 2 MiB GitHub release parts."
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PDF_KW_Selector_v0.5.4_Windows
+          path: dist/PDF_KW_Selector_v0.5.4.${{ github.run_number }}.exe

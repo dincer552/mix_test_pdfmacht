@@ -28,6 +28,7 @@ def open_pdf_match(home):
         desktop_app.App.download_available_update = lambda self: common_install(self, update_button=getattr(self, "_update_button", None), status_var=getattr(self, "_mix_status_var", None))
         from desktop_grouped_app import GroupedApp
         GroupedApp().mainloop()
+        main()  # closing PDF Match returns to the module-selection home screen
     except Exception as exc:
         messagebox.showerror("PDF MATCH başlatılamadı", str(exc))
 
@@ -42,6 +43,7 @@ def open_test_kontrol(home):
         TestControlApp._manual_update_check = lambda self: common_check(self, manual=True, update_button=getattr(self, "_update_button", None), version_label=getattr(self, "_update_build_label", None), status_var=getattr(self, "_mix_status_var", None))
         TestControlApp._start_update = lambda self: common_install(self, update_button=getattr(self, "_update_button", None), status_var=getattr(self, "_mix_status_var", None))
         TestControlApp().mainloop()
+        main()  # closing TEST KONTROL returns to the module-selection home screen
     except Exception as exc:
         messagebox.showerror("TEST KONTROL başlatılamadı", str(exc))
 

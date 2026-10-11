@@ -45,11 +45,11 @@ jobs:
       - name: Write shared build metadata
         shell: pwsh
         env:
-          APP_VERSION: v1.0.0.\${{ github.run_number }}
+          APP_VERSION: v1.0.0.${{ github.run_number }}
         run: |
-          Set-Content -Path mix_meta.py -Value @('"""Combined metadata."""',"BUILD_VERSION = \`"$env:APP_VERSION\`"","BUILD_SHA = \`"$env:GITHUB_SHA\`"") -Encoding UTF8
-          Set-Content -Path pdf_match/build_info.py -Value @('"""PDF Match build metadata."""','import pdf_click_opener  # noqa: F401','import pdf_hover_indicator  # noqa: F401','import status  # noqa: F401','import button_label_fix  # noqa: F401','import voclean_project_selector  # noqa: F401',"BUILD_VERSION = \`"$env:APP_VERSION\`"","BUILD_SHA = \`"$env:GITHUB_SHA\`"") -Encoding UTF8
-          Set-Content -Path test_kontrol/test_build_info.py -Value @('"""TEST KONTROL build metadata."""',"BUILD_VERSION = \`"$env:APP_VERSION\`"","BUILD_SHA = \`"$env:GITHUB_SHA\`"") -Encoding UTF8
+          Set-Content -Path mix_meta.py -Value @('"""Combined metadata."""',"BUILD_VERSION = `"$env:APP_VERSION`"","BUILD_SHA = `"$env:GITHUB_SHA`"") -Encoding UTF8
+          Set-Content -Path pdf_match/build_info.py -Value @('"""PDF Match build metadata."""','import pdf_click_opener  # noqa: F401','import pdf_hover_indicator  # noqa: F401','import status  # noqa: F401','import button_label_fix  # noqa: F401','import voclean_project_selector  # noqa: F401',"BUILD_VERSION = `"$env:APP_VERSION`"","BUILD_SHA = `"$env:GITHUB_SHA`"") -Encoding UTF8
+          Set-Content -Path test_kontrol/test_build_info.py -Value @('"""TEST KONTROL build metadata."""',"BUILD_VERSION = `"$env:APP_VERSION`"","BUILD_SHA = `"$env:GITHUB_SHA`"") -Encoding UTF8
       - name: Build PDF Match icon
         shell: pwsh
         run: |
@@ -59,13 +59,13 @@ jobs:
       - name: Build one combined EXE
         shell: pwsh
         env:
-          APP_VERSION: v1.0.0.\${{ github.run_number }}
+          APP_VERSION: v1.0.0.${{ github.run_number }}
         run: |
           python -m PyInstaller --noconfirm --clean --onefile --windowed --paths pdf_match --paths test_kontrol --hidden-import desktop_grouped_app --hidden-import test_kontrol.app --hidden-import test_updater --hidden-import test_build_info --collect-all pypdf --collect-all tkinterdnd2 --icon pdf_match/AHU_Match.ico --add-data "pdf_match/AHU_Match.ico;." --add-data "test_kontrol/app_icon.png;." --add-data "test_kontrol/SYSR.ST.png;." --add-data "test_kontrol/SYSR.ST_BIG.png;." --name "Mix_Test_PDFMatch_$env:APP_VERSION" launcher.py
       - name: Smoke test combined EXE
         shell: pwsh
         env:
-          APP_VERSION: v1.0.0.\${{ github.run_number }}
+          APP_VERSION: v1.0.0.${{ github.run_number }}
         run: |
           $exe = Join-Path $PWD "dist/Mix_Test_PDFMatch_$env:APP_VERSION.exe"
           if (-not (Test-Path -LiteralPath $exe)) { throw "Combined EXE missing" }
@@ -76,7 +76,7 @@ jobs:
       - name: Prepare release assets
         shell: pwsh
         env:
-          APP_VERSION: v1.0.0.\${{ github.run_number }}
+          APP_VERSION: v1.0.0.${{ github.run_number }}
         run: |
           $source = "dist/Mix_Test_PDFMatch_$env:APP_VERSION.exe"
           Copy-Item $source dist/Mix_Test_PDFMatch_latest.exe
@@ -84,20 +84,20 @@ jobs:
           (Get-FileHash "dist/Mix_Test_PDFMatch_latest.exe" -Algorithm SHA256).Hash.ToLower() | Set-Content dist/Mix_Test_PDFMatch_latest.sha256 -NoNewline
       - name: Publish the single release
         env:
-          GH_TOKEN: \${{ github.token }}
-          APP_VERSION: v1.0.0.\${{ github.run_number }}
+          GH_TOKEN: ${{ github.token }}
+          APP_VERSION: v1.0.0.${{ github.run_number }}
         shell: bash
         run: |
           notes="Version: $APP_VERSION
           Build: $GITHUB_SHA
           Combined AHU Match + TEST KONTROL application."
           if gh release view latest >/dev/null 2>&1; then
-            gh release upload latest dist/Mix_Test_PDFMatch_latest.exe dist/Mix_Test_PDFMatch_latest.sha256 "dist/Mix_Test_PDFMatch_\${GITHUB_SHA}.exe" --clobber
+            gh release upload latest dist/Mix_Test_PDFMatch_latest.exe dist/Mix_Test_PDFMatch_latest.sha256 "dist/Mix_Test_PDFMatch_${GITHUB_SHA}.exe" --clobber
             gh release edit latest --title "MIX TEST PDFMATCH $APP_VERSION - Latest" --notes "$notes"
           else
-            gh release create latest dist/Mix_Test_PDFMatch_latest.exe dist/Mix_Test_PDFMatch_latest.sha256 "dist/Mix_Test_PDFMatch_\${GITHUB_SHA}.exe" --target "$GITHUB_SHA" --title "MIX TEST PDFMATCH $APP_VERSION - Latest" --notes "$notes"
+            gh release create latest dist/Mix_Test_PDFMatch_latest.exe dist/Mix_Test_PDFMatch_latest.sha256 "dist/Mix_Test_PDFMatch_${GITHUB_SHA}.exe" --target "$GITHUB_SHA" --title "MIX TEST PDFMATCH $APP_VERSION - Latest" --notes "$notes"
           fi
       - uses: actions/upload-artifact@v4
         with:
           name: Mix_Test_PDFMatch_Windows
-          path: dist/Mix_Test_PDFMatch_v1.0.0.\${{ github.run_number }}.exe
+          path: dist/Mix_Test_PDFMatch_v1.0.0.${{ github.run_number }}.exe

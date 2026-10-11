@@ -1,0 +1,444 @@
+"""Grouped desktop entry point for PDF kW Selector."""
+from __future__ import annotations
+from pathlib import Path
+import re
+import sys
+import time
+import tkinter as tk
+from tkinter import ttk, messagebox
+import desktop_app as desktop_module
+from app_logger import exception, info, startup
+from desktop_app import App as BaseApp, VERSION
+from drag_drop import install_pdf_drop_targets
+from pdf_viewer import open_pdf_at_page
+from result_grouping import group_result_rows
+from updater import apply_update
+import voclean_project_selector
+from confirmation_workflow import analyze_with_confirmations
+from pdf_master_scan import scan_pdf
+from status import apply_status_tag, install_status_display, status_display_text
+from coordinate_motor_discovery import compare_motor_model_lists, expand_model_quantity
+import motor_fuse_matching as fuse_matching
+from motor_fuse_matching import check_fuse_current
+from stage2_pdf_discovery import motor_fuse_box_for_fan_count
+
+def _path_strings(items): return [str(getattr(item,"path",item)) for item in (items or [])]
+def _confirmed_analyze(pdf1_inputs,pdf2_inputs,progress_callback=None):
+    p1,p2=_path_strings(pdf1_inputs),_path_strings(pdf2_inputs); info("Onaylı analiz girişleri normalize edildi",pdf1_count=len(p1),pdf2_count=len(p2)); return analyze_with_confirmations(p1,p2,progress_callback=progress_callback)
+desktop_module.analyze_batch=_confirmed_analyze
+
+class GroupedApp(BaseApp):
+    def __init__(self):
+        super().__init__(); fuse_matching.set_fuse_current_ranges(fuse_matching.load_fuse_current_ranges()); self._analysis_started_at=None; self._grouped_pdf1_scan_cache={}; self._ebm_pdf_keys=set(); self._vocclean_pdf_keys=set(); self._sysreco_pdf_keys=set(); self._unmatched_pdf_keys=set(); self._pdf_accounting_error_shown=False; self._build_ebm_tab(); self._build_voclean_tab(); self._build_sysreco_tab(); self.tabs.tab(0,text="DANFOS"); self.tabs.insert(1,self.ebm_tab); self.tabs.insert(2,self.voclean_tab); self.tabs.insert(3,self.sysreco_tab); self.unmatched_tab_index=lambda:4; self.tree.tag_configure("mismatch",background="#ffb3b3",foreground="#000000"); install_pdf_drop_targets(self,self.pdf1_box,self.pdf2_box); install_status_display(self)
+    def _build_ebm_tab(self):
+        tab=ttk.Frame(self.tabs, style="White.TFrame"); self.tabs.add(tab,text="Ziehl-Ab. / EBM (0)"); cols=("Proje","AHU","Fan","Seçim çıktısı","Elektrik p.","Seçim motor modeli / akımı","Elektrik motor modeli","Elektrik sigortası","Sigorta kontrolü","Durum"); widths={"Proje":240,"AHU":120,"Fan":120,"Seçim çıktısı":260,"Elektrik p.":300,"Seçim motor modeli / akımı":280,"Elektrik motor modeli":250,"Elektrik sigortası":190,"Sigorta kontrolü":300,"Durum":240}; self._fuse_limits_button=ttk.Button(tab,text="Akım limit",command=self._open_fuse_current_settings,style="Small.Secondary.TButton"); self._fuse_limits_button.grid(row=0,column=0,sticky="e",padx=8,pady=(5,2)); self.ebm_tree=ttk.Treeview(tab,columns=cols,show="headings"); tab.grid_rowconfigure(1,weight=1); tab.grid_columnconfigure(0,weight=1)
+        for col in cols:self.ebm_tree.heading(col,text=col);self.ebm_tree.column(col,width=widths[col],anchor="w")
+        self.ebm_tree.tag_configure("model_match",background="#e6ffed",foreground="#116329")
+        self.ebm_tree.tag_configure("model_mismatch",background="#ffebe9",foreground="#b62324")
+        scroll=ttk.Scrollbar(tab,orient="vertical",command=lambda *args: (self.ebm_tree.yview(*args), self._cell_hover_box.hide()));xscroll=ttk.Scrollbar(tab,orient="horizontal",command=self.ebm_tree.xview);self.ebm_tree.configure(yscrollcommand=scroll.set,xscrollcommand=xscroll.set);self.ebm_tree.grid(row=1,column=0,sticky="nsew",padx=(5,0),pady=(2,0));scroll.grid(row=1,column=1,sticky="ns",padx=(0,5),pady=(2,0));xscroll.grid(row=2,column=0,sticky="ew",padx=5,pady=(0,5));self.ebm_tab=tab
+        self._ebm_cell_data: dict[str, dict] = {}
+        self.ebm_tree.bind("<Button-1>", self._on_ebm_cell_click)
+        self.ebm_tree.bind("<Double-1>", self._on_ebm_cell_click)
+        self.ebm_tree.bind("<Motion>", self._on_ebm_cell_motion)
+        self.ebm_tree.bind("<Leave>", lambda e: (self.ebm_tree.configure(cursor=""), self._cell_hover_box.hide()))
+        self.ebm_tree.bind("<MouseWheel>", lambda e: self._cell_hover_box.hide(), add="+")
+    def _open_fuse_current_settings(self):
+        dialog=tk.Toplevel(self)
+        dialog.title("Akım limit ayarları")
+        dialog.transient(self)
+        dialog.resizable(False,False)
+        dialog.grab_set()
+        content=ttk.Frame(dialog,padding=14)
+        content.grid(sticky="nsew")
+        ttk.Label(content,text="Sigorta kademeleri ve akım üst limitlerini düzenleyin.",style="Muted.TLabel").grid(row=0,column=0,columnspan=2,sticky="w",pady=(0,8))
+        ttk.Label(content,text="Sigorta (A)").grid(row=1,column=0,padx=(0,8),sticky="w")
+        ttk.Label(content,text="Akım üst limiti (A)").grid(row=1,column=1,padx=(0,8),sticky="w")
+        rating_vars=[]
+        maximum_vars=[]
+        for index,item in enumerate(fuse_matching.FUSE_CURRENT_RANGES,2):
+            rating_var=tk.StringVar(value=str(item.rating_a))
+            maximum_var=tk.StringVar(value=f"{item.maximum_current_a:g}")
+            ttk.Entry(content,textvariable=rating_var,width=14).grid(row=index,column=0,padx=(0,8),pady=2)
+            ttk.Entry(content,textvariable=maximum_var,width=18).grid(row=index,column=1,padx=(0,8),pady=2)
+            rating_vars.append(rating_var)
+            maximum_vars.append(maximum_var)
+
+        def restore_defaults():
+            for rating_var,maximum_var,item in zip(rating_vars,maximum_vars,fuse_matching.DEFAULT_FUSE_CURRENT_RANGES):
+                rating_var.set(str(item.rating_a))
+                maximum_var.set(f"{item.maximum_current_a:g}")
+
+        def save():
+            try:
+                updated=fuse_matching.save_fuse_current_ranges(
+                    [
+                        {"rating_a":rating_var.get().strip(),"maximum_current_a":maximum_var.get().strip()}
+                        for rating_var,maximum_var in zip(rating_vars,maximum_vars)
+                    ]
+                )
+                fuse_matching.set_fuse_current_ranges(updated)
+            except (ValueError,KeyError,TypeError,OSError) as exc:
+                messagebox.showerror("Akım limit ayarları",str(exc),parent=dialog)
+                return
+            if getattr(self,"analysis",None) is not None:
+                self._render_ebm()
+            dialog.destroy()
+
+        buttons=ttk.Frame(content)
+        buttons.grid(row=len(rating_vars)+2,column=0,columnspan=2,sticky="ew",pady=(10,0))
+        ttk.Button(buttons,text="Varsayılanlar",command=restore_defaults,style="Small.Secondary.TButton").pack(side="left")
+        ttk.Button(buttons,text="İptal",command=dialog.destroy,style="Small.Secondary.TButton").pack(side="right")
+        ttk.Button(buttons,text="Kaydet",command=save,style="Primary.TButton").pack(side="right",padx=(0,6))
+        dialog.update_idletasks()
+        x=self.winfo_rootx()+(self.winfo_width()-dialog.winfo_width())//2
+        y=self.winfo_rooty()+(self.winfo_height()-dialog.winfo_height())//2
+        dialog.geometry(f"+{x}+{y}")
+        dialog.wait_window()
+    def _build_voclean_tab(self):
+        tab=ttk.Frame(self.tabs, style="White.TFrame"); self.tabs.add(tab,text="VOCLEAN (0)"); cols=("Proje","Seçim PDF","VOClean kW","Seçim PDF Sayfa","Elektrik P. PDF","AHU","Durum"); self.voclean_tree=ttk.Treeview(tab,columns=cols,show="headings"); widths={"Proje":260,"Seçim PDF":300,"VOClean kW":100,"Seçim PDF Sayfa":110,"Elektrik P. PDF":300,"AHU":180,"Durum":280}
+        for col in cols:self.voclean_tree.heading(col,text=col);self.voclean_tree.column(col,width=widths[col],anchor="w")
+        scroll=ttk.Scrollbar(tab,orient="vertical",command=lambda *args: (self.voclean_tree.yview(*args), self._cell_hover_box.hide()));self.voclean_tree.configure(yscrollcommand=scroll.set);self.voclean_tree.pack(side="left",fill="both",expand=True,padx=(5,0),pady=5);scroll.pack(side="right",fill="y",padx=(0,5),pady=5);self.voclean_tab=tab
+        self._voclean_cell_data: dict[str, dict] = {}
+        self.voclean_tree.bind("<Button-1>", self._on_voclean_cell_click)
+        self.voclean_tree.bind("<Double-1>", self._on_voclean_cell_click)
+        self.voclean_tree.bind("<Motion>", self._on_voclean_cell_motion)
+        self.voclean_tree.bind("<Leave>", lambda e: (self.voclean_tree.configure(cursor=""), self._cell_hover_box.hide()))
+        self.voclean_tree.bind("<MouseWheel>", lambda e: self._cell_hover_box.hide(), add="+")
+    def _build_sysreco_tab(self):
+        tab=ttk.Frame(self.tabs, style="White.TFrame"); self.tabs.add(tab,text="SYSRECO (0)"); cols=("Proje","AHU","PDF","SysReco Model"); self.sysreco_tree=ttk.Treeview(tab,columns=cols,show="headings"); widths={"Proje":320,"AHU":180,"PDF":420,"SysReco Model":180}
+        for col in cols:self.sysreco_tree.heading(col,text=col);self.sysreco_tree.column(col,width=widths[col],anchor="w")
+        scroll=ttk.Scrollbar(tab,orient="vertical",command=lambda *args: (self.sysreco_tree.yview(*args), self._cell_hover_box.hide()));self.sysreco_tree.configure(yscrollcommand=scroll.set);self.sysreco_tree.pack(side="left",fill="both",expand=True,padx=(5,0),pady=5);scroll.pack(side="right",fill="y",padx=(0,5),pady=5);self.sysreco_tab=tab
+        self._sysreco_cell_data: dict[str, dict] = {}
+        self.sysreco_tree.bind("<Button-1>", self._on_sysreco_cell_click)
+        self.sysreco_tree.bind("<Double-1>", self._on_sysreco_cell_click)
+        self.sysreco_tree.bind("<Motion>", self._on_sysreco_cell_motion)
+        self.sysreco_tree.bind("<Leave>", lambda e: (self.sysreco_tree.configure(cursor=""), self._cell_hover_box.hide()))
+        self.sysreco_tree.bind("<MouseWheel>", lambda e: self._cell_hover_box.hide(), add="+")
+    def _grouped_scan_pdf1(self,document):
+        key=str(document.path).casefold(); scan=self._grouped_pdf1_scan_cache.get(key)
+        if scan is None: scan=scan_pdf(document.path,"PDF1"); self._grouped_pdf1_scan_cache[key]=scan
+        return scan
+    def _special_pdf_sets(self):
+        ebm=set(); voc=set(); sysr=set(); accepted={"EXACT","NORMALIZED_MATCH","USER_APPROVED"}
+        for document in self.analysis.pdf1_documents:
+            key=("PDF1",str(document.path).casefold()); scan=self._grouped_scan_pdf1(document)
+            if scan.pdf1_ebm_pages: ebm.add(key)
+            if any(self._is_voclean_text(text) for text in scan.page_texts): voc.add(key)
+            if self._is_sysreco_text("\n".join(scan.page_texts)): sysr.add(key)
+        for ahu in self.analysis.ahu_matches:
+            if getattr(ahu.match,"status","") not in accepted: continue
+            pdf1_keys={("PDF1",str(p).casefold()) for p in ahu.pdf1_files}
+            if pdf1_keys & ebm: ebm.update(("PDF2",str(p).casefold()) for p in ahu.pdf2_files)
+        for document in self.analysis.pdf2_documents:
+            if self._is_voclean_document(document,"PDF2"): voc.add(("PDF2",str(document.path).casefold()))
+        voc-=ebm; sysr-=ebm; sysr-=voc
+        self._ebm_pdf_keys=ebm; self._vocclean_pdf_keys=voc; self._sysreco_pdf_keys=sysr
+        return ebm,voc,sysr
+    @staticmethod
+    def _vocclean_power_prefix(value_kw): return f"BA{int(round(float(value_kw)*100)):03d}-"
+    @staticmethod
+    def _is_voclean_text(text): return bool(re.search(r"\bVOC\s*LEAN\b",text or "",re.I))
+    def _is_voclean_document(self,document,side=None):
+        if side == "PDF2": return "voclean" in str(getattr(getattr(document,"project",None),"project_name","") or "").casefold()
+        return ("PDF1",str(document.path).casefold()) in self._vocclean_pdf_keys
+    @staticmethod
+    def _is_sysreco_text(text): return bool(re.search(r"\bSysReco\b",text or "",re.I))
+    @staticmethod
+    def _sysreco_models(text): return list(dict.fromkeys(m.group(0).strip() for m in re.finditer(r"\bSysReco\s+FX\d+\b",text or "",re.I)))
+    def _sysreco_documents(self):
+        self._special_pdf_sets(); result=[]
+        for document in self.analysis.pdf1_documents:
+            if ("PDF1",str(document.path).casefold()) not in self._sysreco_pdf_keys: continue
+            scan=self._grouped_scan_pdf1(document); result.append((document,"\n".join(scan.page_texts)))
+        return result
+    def _render_voclean(self):
+        for item in self.voclean_tree.get_children(): self.voclean_tree.delete(item)
+        self._voclean_cell_data = {}
+        self._special_pdf_sets(); rows=[]
+        for document in self.analysis.pdf1_documents:
+            key=("PDF1",str(document.path).casefold())
+            if key not in self._vocclean_pdf_keys: continue
+            scan=self._grouped_scan_pdf1(document); motor_results=list(scan.pdf1_motors)
+            if not motor_results:
+                rows.append((document.project.project_name or "-",Path(document.path).name,"-","-","-","-","VOClean bulundu; Plug fan kW bulunamadı",str(document.path),1,None,1))
+                continue
+            for motor in motor_results:
+                if motor.value_kw is None: continue
+                prefix=self._vocclean_power_prefix(motor.value_kw).upper(); matches=[]
+                for pdf2_document in self.analysis.pdf2_documents:
+                    for ahu in pdf2_document.equipment:
+                        ahu_text=str(ahu).strip()
+                        if ahu_text.upper().startswith(prefix): matches.append((pdf2_document,ahu_text))
+                if matches:
+                    for pdf2_document,ahu_text in matches:
+                        rows.append((document.project.project_name or "-",Path(document.path).name,f"{motor.value_kw:g}",str(motor.page_number),Path(pdf2_document.path).name,ahu_text,f"BA kodu eşleşti ({prefix[:-1]})",str(document.path),motor.page_number,str(pdf2_document.path),1))
+                else:
+                    rows.append((document.project.project_name or "-",Path(document.path).name,f"{motor.value_kw:g}",str(motor.page_number),"-","-",f"PDF2 AHU eşleşmesi yok; beklenen {prefix[:-1]}-xxxxx",str(document.path),motor.page_number,None,1))
+        rows.sort(key=lambda r:(str(r[0]).casefold(),str(r[1]).casefold(),str(r[3]),str(r[5]).casefold()))
+        for r in rows:
+            item_id = self.voclean_tree.insert("","end",values=(r[0],r[1],r[2],r[3],r[4],r[5],status_display_text(r[6])))
+            apply_status_tag(self.voclean_tree, item_id, r[6])
+            self._voclean_cell_data[item_id] = {"pdf1_path": r[7], "pdf1_page": r[8], "pdf2_path": r[9], "pdf2_page": r[10], "pdf1_name": r[1], "pdf2_name": r[4]}
+        self.tabs.tab(self.voclean_tab,text=f"VOCLEAN ({len(self._vocclean_pdf_keys)})")
+    def _render_sysreco(self):
+        for item in self.sysreco_tree.get_children(): self.sysreco_tree.delete(item)
+        self._sysreco_cell_data = {}
+        self._special_pdf_sets(); rows=[]
+        for document,full_text in self._sysreco_documents():
+            models=self._sysreco_models(full_text) or ["SysReco modeli bulunamadı"]
+            for model in models: rows.append((document.project.project_name or "-",", ".join(str(value) for value in document.equipment) if document.equipment else "-",Path(document.path).name,model,str(document.path),1))
+        rows.sort(key=lambda r:(str(r[0]).casefold(),str(r[1]).casefold(),str(r[2]).casefold(),str(r[3]).casefold()))
+        for r in rows:
+            item_id = self.sysreco_tree.insert("","end",values=(r[0],r[1],r[2],r[3])); self._sysreco_cell_data[item_id] = {"pdf_path": r[4], "page": r[5], "pdf_name": r[2]}
+        self.tabs.tab(self.sysreco_tab,text=f"SYSRECO ({len(self._sysreco_pdf_keys)})")
+    def _render_ebm(self):
+        for item in self.ebm_tree.get_children(): self.ebm_tree.delete(item)
+        self._ebm_cell_data = {}
+        self._special_pdf_sets(); rows=[]
+        for document in self.analysis.pdf1_documents:
+            key=("PDF1",str(document.path).casefold())
+            if key not in self._ebm_pdf_keys: continue
+            matching=[]
+            for ahu in self.analysis.ahu_matches:
+                if getattr(ahu.match,"status","") not in {"EXACT","NORMALIZED_MATCH","USER_APPROVED"}: continue
+                if str(document.path).casefold() in {str(p).casefold() for p in ahu.pdf1_files}: matching.extend(ahu.pdf2_files)
+            pdf2_paths = list(dict.fromkeys(matching))
+            scan=self._grouped_scan_pdf1(document)
+            for ahu_id in tuple(document.equipment) or ("-",):
+                pdf2_scans = [scan_pdf(path,"PDF2") for path in pdf2_paths]
+                for role, label in (("supply_fan","Supply air"),("exhaust_fan","Exhaust air")):
+                    selection_results = [model for model in scan.pdf1_motor_models if model.component_role == role]
+                    if role == "exhaust_fan" and not selection_results:
+                        continue
+                    selection_models = [value for model in selection_results for value in expand_model_quantity(model)]
+                    electrical_results = [model for pdf2_scan in pdf2_scans for model in pdf2_scan.pdf2_motor_models if model.component_role == role]
+                    electrical_models = [model.model for model in electrical_results]
+                    comparison = compare_motor_model_lists(selection_models,electrical_models)
+                    model_matches = comparison == "MODEL EŞLEŞTİ"
+                    selection_display = ", ".join(
+                        " ".join(part for part in (
+                            f"{model.model} ({model.quantity})" if model.quantity else model.model,
+                            f"{model.current} A" if model.current else "",
+                        ) if part)
+                        for model in selection_results
+                    ) or "-"
+                    electrical_display = ", ".join(electrical_models) or "-"
+                    fan_count = sum(len(expand_model_quantity(model)) for model in selection_results)
+                    fuse_box = motor_fuse_box_for_fan_count(fan_count)
+                    fuse_results = [
+                        fuse
+                        for pdf2_scan in pdf2_scans
+                        for fuse in pdf2_scan.pdf2_motor_fuses
+                        if fuse.component_role == role and fuse.coordinate_box == fuse_box
+                    ]
+                    fuse_display = ", ".join(
+                        f"{fuse.pole_count}x{fuse.fuse_rating_a}A" if fuse.pole_count else f"{fuse.fuse_rating_a}A"
+                        for fuse in fuse_results if fuse.fuse_rating_a is not None
+                    ) or "Sigorta bulunamadı"
+                    currents = [model.current for model in selection_results if model.current]
+                    fuse_ratings = [fuse.fuse_rating_a for fuse in fuse_results if fuse.fuse_rating_a is not None]
+                    fuse_checks = [check_fuse_current(current, rating) for current in currents for rating in fuse_ratings]
+                    if not currents:
+                        fuse_status = "UYGUN DEĞİL: seçim akımı bulunamadı"
+                    elif not fuse_checks:
+                        fuse_status = "UYGUN DEĞİL: elektrik sigortası bulunamadı"
+                    elif all(result.status == "MATCH" for result in fuse_checks):
+                        fuse_status = "UYGUN"
+                    else:
+                        failures = list(dict.fromkeys(result.explanation for result in fuse_checks if result.status != "MATCH"))
+                        fuse_status = "UYGUN DEĞİL: " + "; ".join(failures)
+                    fuse_matches = bool(fuse_checks) and all(result.status == "MATCH" for result in fuse_checks)
+                    status = "MATCH" if model_matches and fuse_matches else "MISMATCH"
+                    if not model_matches:
+                        status += f": {comparison}"
+                    if not fuse_matches:
+                        status += f": {fuse_status}"
+                    selection_page = min((model.page_number for model in selection_results),default=1)
+                    electrical_page = min((model.page_number for model in electrical_results),default=1)
+                    rows.append((
+                        document.project.project_name or "-",ahu_id or "-",label,
+                        Path(document.path).name,", ".join(Path(path).name for path in pdf2_paths) or "-",
+                        selection_display,electrical_display,fuse_display,fuse_status,status,
+                        str(document.path),selection_page,pdf2_paths[0] if pdf2_paths else None,electrical_page,
+                        "model_match" if status == "MATCH" else "model_mismatch",
+                    ))
+        rows.sort(key=lambda r:(str(r[1]).casefold(),str(r[2]).casefold(),str(r[0]).casefold()))
+        for r in rows:
+            item_id = self.ebm_tree.insert("","end",values=r[:10],tags=(r[14],))
+            apply_status_tag(self.ebm_tree, item_id, r[9])
+            self._ebm_cell_data[item_id] = {
+                "pdf1_path": r[10],
+                "pdf1_page": r[11],
+                "pdf2_path": r[12],
+                "pdf2_page": r[13],
+                "pdf1_name": r[3],
+                "pdf2_name": r[4],
+            }
+        self.tabs.tab(self.ebm_tab,text=f"Ziehl-Ab. / EBM ({len(self._ebm_pdf_keys)})")
+    def _selected_pdf_keys(self):
+        result=set()
+        for side,inputs in (("PDF1",self.pdf1_inputs),("PDF2",self.pdf2_inputs)):
+            for item in inputs: result.add((side,str(getattr(item,"path",item)).casefold()))
+        return result
+    def _matched_pdf_keys(self):
+        result=set(); accepted={"EXACT","NORMALIZED_MATCH","USER_APPROVED"}
+        for ahu in self.analysis.ahu_matches:
+            if getattr(ahu.match,"status","") not in accepted: continue
+            result.update(("PDF1",str(path).casefold()) for path in ahu.pdf1_files); result.update(("PDF2",str(path).casefold()) for path in ahu.pdf2_files)
+        return result
+    def _pdf_classification(self):
+        all_keys=self._selected_pdf_keys(); ebm,voc,sysr=self._special_pdf_sets(); matched=self._matched_pdf_keys(); special=ebm|voc|sysr; danfos=matched-special; unmatched=all_keys-special-matched; categories={"DANFOS":danfos,"Ziehl-Ab. / EBM":ebm,"VOCLEAN":voc,"SYSRECO":sysr,"EŞLEŞMEYEN":unmatched}; return all_keys,categories
+    def _validate_pdf_accounting(self):
+        all_keys,categories=self._pdf_classification(); sets=list(categories.values()); overlaps=[]; names=list(categories)
+        for i in range(len(sets)):
+            for j in range(i+1,len(sets)):
+                overlap=sets[i]&sets[j]
+                if overlap: overlaps.append(f"{names[i]} ∩ {names[j]} = {len(overlap)}")
+        classified=set().union(*sets) if sets else set(); missing=all_keys-classified; extra=classified-all_keys; total=sum(len(s) for s in sets); ok=(not overlaps and not missing and not extra and total==len(all_keys))
+        if not ok:
+            detail=f"Eklenen PDF: {len(all_keys)} | Sekmeler toplamı: {total} | Eksik: {len(missing)} | Fazla: {len(extra)}"
+            if overlaps: detail += " | Çakışma: " + ", ".join(overlaps)
+            self.status.configure(text="PDF HESAP HATASI: " + detail); info("PDF HESAP HATASI",selected_pdf_count=len(all_keys),classified_total=total,missing=list(missing),extra=list(extra),overlaps=overlaps)
+            if not self._pdf_accounting_error_shown: self._pdf_accounting_error_shown=True; messagebox.showerror("PDF sınıflandırma hatası",detail)
+        else: self._pdf_accounting_error_shown=False
+        return ok,categories
+    def _refresh_grouped_tab_counts(self):
+        _,categories=self._validate_pdf_accounting(); counts={name:len(values) for name,values in categories.items()}; self._unmatched_pdf_keys=categories["EŞLEŞMEYEN"]
+        classified_unmatched_count=counts["EŞLEŞMEYEN"]
+        rendered_unmatched_count=len(self.unmatched_tree.get_children())
+        counts["EŞLEŞMEYEN"]=rendered_unmatched_count
+        if classified_unmatched_count!=rendered_unmatched_count:
+            info("Eşleşmeyen PDF sekme sayısı tablo satırıyla eşitlendi",classified_count=classified_unmatched_count,rendered_count=rendered_unmatched_count)
+        self.tabs.tab(0,text=f"DANFOS ({counts['DANFOS']})"); self.tabs.tab(self.ebm_tab,text=f"Ziehl-Ab. / EBM ({counts['Ziehl-Ab. / EBM']})"); self.tabs.tab(self.vocclean_tab,text=f"VOCLEAN ({counts['VOCLEAN']})"); self.tabs.tab(self.sysreco_tab,text=f"SYSRECO ({counts['SYSRECO']})"); self.tabs.tab(self.unmatched_tab_index(),text=f"EŞLEŞMEYEN PDF'LER ({counts['EŞLEŞMEYEN']})"); info("PDF sekme sınıflandırması tamamlandı",selected_pdf_count=sum(counts.values()),**{f"{k.lower().replace('-','_').replace(' ','_')}_pdf_count":v for k,v in counts.items()})
+    def _render_unmatched(self):
+        for item in self.unmatched_tree.get_children(): self.unmatched_tree.delete(item)
+        self._unmatched_cell_data = {}
+        _,categories=self._validate_pdf_accounting(); unmatched=categories["EŞLEŞMEYEN"]; documents={("PDF1",str(d.path).casefold()):(d,"PDF1") for d in self.analysis.pdf1_documents}; documents.update({("PDF2",str(d.path).casefold()):(d,"PDF2") for d in self.analysis.pdf2_documents}); rows=[]
+        for key in sorted(unmatched):
+            item=documents.get(key)
+            if item:
+                document,side=item; project=document.project.project_name or "-"; ahus=", ".join(str(value) for value in document.equipment if str(value).strip()) if document.equipment else "-"; reason="AHU eşleşmesine giremedi" if document.equipment else "Ekipman/AHU tespit edilemedi"; path_val=str(document.path)
+            else: side,path_val=key; project=ahus="-"; reason="PDF analiz dışında kaldı"
+            rows.append((side,Path(key[1]).name,project,ahus,reason,path_val))
+        for side,pdf,project,ahus,reason,path in rows:
+            item_id = self.unmatched_tree.insert("","end",values=(side,pdf,project,ahus,reason),tags=(path,)); self._unmatched_cell_data[item_id] = {"path": path, "pdf_path": path, "name": pdf, "page": 1}
+        self._unmatched_pdf_keys=unmatched
+        # Update from the rendered rows immediately.  A later grouped-result
+        # renderer must not be able to leave a visible row with a stale (0)
+        # tab count.
+        self.tabs.tab(self.unmatched_tab_index(),text=f"EŞLEŞMEYEN PDF'LER ({len(rows)})")
+    def _clear_grouped_results(self):
+        for item in self.ebm_tree.get_children(): self.ebm_tree.delete(item)
+        for item in self.voclean_tree.get_children(): self.voclean_tree.delete(item)
+        for item in self.sysreco_tree.get_children(): self.sysreco_tree.delete(item)
+        if hasattr(self, "_ebm_cell_data"): self._ebm_cell_data.clear()
+        if hasattr(self, "_voclean_cell_data"): self._voclean_cell_data.clear()
+        if hasattr(self, "_sysreco_cell_data"): self._sysreco_cell_data.clear()
+        self._grouped_pdf1_scan_cache.clear(); self._ebm_pdf_keys.clear(); self._vocclean_pdf_keys.clear(); self._sysreco_pdf_keys.clear(); self._unmatched_pdf_keys.clear(); self._pdf_accounting_error_shown=False; self.tabs.tab(0,text="DANFOS (0)"); self.tabs.tab(self.ebm_tab,text="Ziehl-Ab. / EBM (0)"); self.tabs.tab(self.voclean_tab,text="VOCLEAN (0)"); self.tabs.tab(self.sysreco_tab,text="SYSRECO (0)")
+    def _on_ebm_cell_click(self, event):
+        region = self.ebm_tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        col = self.ebm_tree.identify_column(event.x)
+        row_id = self.ebm_tree.identify_row(event.y)
+        if not row_id or col not in ("#4", "#5"):
+            return
+        data = getattr(self, "_ebm_cell_data", {}).get(row_id, {})
+        if col == "#4":
+            pdf_path = data.get("pdf1_path")
+            page = data.get("pdf1_page", 1)
+            desc = f"Seçim çıktısı (PDF1): {data.get('pdf1_name', '')}"
+        else:
+            pdf_path = data.get("pdf2_path")
+            page = data.get("pdf2_page", 1)
+            desc = f"Elektrik projesi (PDF2): {data.get('pdf2_name', '')}"
+        if pdf_path:
+            self.open_pdf_document(pdf_path, page, desc)
+
+    def _on_ebm_cell_motion(self, event):
+        region = self.ebm_tree.identify_region(event.x, event.y)
+        col = self.ebm_tree.identify_column(event.x)
+        row_id = self.ebm_tree.identify_row(event.y)
+        if region == "cell" and col in ("#4", "#5") and row_id:
+            data = getattr(self, "_ebm_cell_data", {}).get(row_id, {})
+            key = "pdf1_path" if col == "#4" else "pdf2_path"
+            if data.get(key):
+                self.ebm_tree.configure(cursor="hand2")
+                self._cell_hover_box.show(self.ebm_tree, row_id, col)
+                return
+        self.ebm_tree.configure(cursor="")
+        self._cell_hover_box.hide()
+
+    def _on_sysreco_cell_click(self, event):
+        region = self.sysreco_tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        col = self.sysreco_tree.identify_column(event.x)
+        row_id = self.sysreco_tree.identify_row(event.y)
+        if not row_id or col != "#3":
+            return
+        data = getattr(self, "_sysreco_cell_data", {}).get(row_id, {})
+        pdf_path = data.get("pdf_path")
+        if pdf_path:
+            self.open_pdf_document(pdf_path, data.get("page", 1), f"SysReco PDF: {data.get('pdf_name', '')}")
+
+    def _on_sysreco_cell_motion(self, event):
+        region = self.sysreco_tree.identify_region(event.x, event.y)
+        col = self.sysreco_tree.identify_column(event.x)
+        row_id = self.sysreco_tree.identify_row(event.y)
+        if region == "cell" and col == "#3" and row_id:
+            data = getattr(self, "_sysreco_cell_data", {}).get(row_id, {})
+            if data.get("pdf_path"):
+                self.sysreco_tree.configure(cursor="hand2"); self._cell_hover_box.show(self.sysreco_tree,row_id,col); return
+        self.sysreco_tree.configure(cursor=""); self._cell_hover_box.hide()
+    def _on_voclean_cell_click(self,event):
+        region=self.voclean_tree.identify_region(event.x,event.y)
+        if region!="cell": return
+        col=self.voclean_tree.identify_column(event.x); row_id=self.voclean_tree.identify_row(event.y)
+        if not row_id or col not in ("#2","#5"): return
+        data=getattr(self,"_voclean_cell_data",{}).get(row_id,{})
+        if col=="#2": pdf_path=data.get("pdf1_path"); page=data.get("pdf1_page",1); desc=f"VOClean PDF1 (Seçim): {data.get('pdf1_name','')}"
+        else: pdf_path=data.get("pdf2_path"); page=data.get("pdf2_page",1); desc=f"VOClean PDF2 (Elektrik): {data.get('pdf2_name','')}"
+        if pdf_path:self.open_pdf_document(pdf_path,page,desc)
+    def _on_voclean_cell_motion(self,event):
+        region=self.voclean_tree.identify_region(event.x,event.y); col=self.voclean_tree.identify_column(event.x); row_id=self.voclean_tree.identify_row(event.y)
+        if region=="cell" and col in ("#2","#5") and row_id:
+            data=getattr(self,"_voclean_cell_data",{}).get(row_id,{})
+            if data.get("pdf1_path" if col=="#2" else "pdf2_path"):
+                self.voclean_tree.configure(cursor="hand2"); self._cell_hover_box.show(self.voclean_tree,row_id,col); return
+        self.voclean_tree.configure(cursor=""); self._cell_hover_box.hide()
+    def _post_analysis(self):
+        try:
+            self._render_ebm(); self._render_voclean(); self._render_sysreco(); self._render_unmatched(); rows=[self.tree.item(i,"values") for i in self.tree.get_children()]; grouped=group_result_rows(rows)
+            for i in self.tree.get_children(): self.tree.delete(i)
+            self._tree_cell_data = {}
+            for row in grouped:
+                item_id=self.tree.insert("","end",values=row,tags=("mismatch",) if len(row)>5 and str(row[5]).strip()=="MISMATCH" else ())
+                if len(row) > 5:
+                    apply_status_tag(self.tree, item_id, row[5])
+                if len(row)>9:
+                    p1_p=int(row[7]) if str(row[7]).strip().isdigit() else None; p2_p=int(row[9]) if str(row[9]).strip().isdigit() else None
+                    self._tree_cell_data[item_id]={"pdf1_path":row[6] or None,"pdf1_page":p1_p,"pdf2_path":row[8] or None,"pdf2_page":p2_p}
+            self._refresh_grouped_tab_counts(); elapsed=time.perf_counter()-self._analysis_started_at if self._analysis_started_at is not None else None
+            duplicate_warnings = tuple(getattr(self.analysis, "duplicate_warnings", ()) or ())
+            if duplicate_warnings:
+                messagebox.showwarning(
+                    "Tekrarlanan proje / AHU",
+                    "Aynı proje kodu ve AHU için birden fazla PDF bulundu.\n\n"
+                    "Bir dosya eşleştirildi; tekrar olan dosya EŞLEŞMEYEN PDF'LER sekmesine alındı.\n\n"
+                    + "\n\n".join(duplicate_warnings),
+                    parent=self,
+                )
+            if elapsed is not None:self.status.configure(text=f"Analiz süresi: {elapsed:.2f} sn | PDF {len(self._selected_pdf_keys())} | AHU {len(self.analysis.ahu_matches)} | Motor {len(self.analysis.motor_comparisons)} | MATCH/MISMATCH sonuçları hazır"); info("Toplu analiz tamamlandı",elapsed_seconds=round(elapsed,3),selected_pdf_count=len(self._selected_pdf_keys()),ahu_count=len(self.analysis.ahu_matches),motor_count=len(self.analysis.motor_comparisons))
+            self.refresh_logs()
+        except Exception as exc: exception("Project/AHU sonuç gruplama hatası",exc); self.refresh_logs()
+    def compare(self): self._analysis_started_at=time.perf_counter(); super().compare()
+
+if __name__=="__main__":
+    startup(VERSION)
+    if len(sys.argv)>=2 and sys.argv[1]=="--apply-update":
+        try: apply_update(sys.argv[2],sys.argv[3],int(sys.argv[4]))
+        except Exception as exc: exception("Updater modu başarısız",exc,argv=sys.argv); raise
+    else:
+        try: GroupedApp().mainloop()
+        except Exception as exc: exception("GUI ana döngüsü beklenmedik hata ile kapandı",exc); raise

@@ -1,0 +1,210 @@
+"""Stage 1: discover rated motor-power pages and fan direction."""
+from __future__ import annotations
+
+import re
+import unicodedata
+from dataclasses import asdict, dataclass, replace
+
+from app_logger import debug, exception, info, warning
+from motor_database import expand_motor_group
+from motor_brand import normalize_motor_brand
+from pdf_kw_selector import normalize_power
+
+RATED_POWER_RE = re.compile(
+    r"(?:\brated\s+power\b|(?:anma\s+g(?:ü|u|�)c(?:ü|u|�)|anma\s+g[^a-z0-9\s]{0,2}c[^a-z0-9\s]{0,2}))"
+    r"\s*\[?\s*kw\s*\]?\s*[:=\-]?\s*"
+    r"(?P<value>\d+(?:[.,]\d+)?)"
+    r"\s*[x×]\s*\(\s*(?P<quantity>\d+)\s*[x×]\s*(?P<group_count>\d+)\s*\)",
+    re.IGNORECASE,
+)
+FAN_MOTOR_POWER_RE = re.compile(
+    r"fan\s+motor\s+power\s*(?:/\s*nominal\s+rpm\s*)?[:=\-]?\s*"
+    r"(?P<value>\d+(?:[.,]\d+)?)\s*\[?\s*kw\s*\]?"
+    r"(?:\s*\(?\s*(?P<quantity>\d+(?:[.,]\d+)?(?:\s*[x×]\s*\d+)?)\s*\)?)?",
+    re.IGNORECASE,
+)
+SUMMARY_FAN_MOTOR_POWER_RE = re.compile(
+    r"fan\s+motor\s+power\s*/?\s*nominal\s+rpm\s*.*?"
+    r"(?P<supply_value>\d+(?:[.,]\d+)?)\s*\[?\s*kw\s*\]?\s*\(?\s*"
+    r"(?P<supply_quantity>\d+(?:[.,]\d+)?(?:\s*[x×]\s*\d+)?)\s*\)? .*?"
+    r"(?P<return_value>\d+(?:[.,]\d+)?)\s*\[?\s*kw\s*\]?\s*\(?\s*"
+    r"(?P<return_quantity>\d+(?:[.,]\d+)?(?:\s*[x×]\s*\d+)?)\s*\)?",
+    re.IGNORECASE,
+)
+SUMMARY_GROUPED_KW_RE = re.compile(
+    r"(?P<value>\d+(?:[.,]\d+)?)\s*\[?\s*kw\s*\]?\s*\(\s*"
+    r"(?P<quantity>\d+\s*[x×]\s*\d+)\s*\)",
+    re.IGNORECASE,
+)
+STANDALONE_MOTOR_POWER_RE = re.compile(
+    r"(?:anma\s+g[^\s]{0,8}|rated\s+power|fan\s+motor\s+power)\s*\[?\s*kw\s*\]?\s*[:=\-]?\s*"
+    r"(?P<value>\d+(?:[.,]\d+)?)",
+    re.IGNORECASE,
+)
+MODEL_BRAND_RE = re.compile(
+    r"\bmodel\s+brand\b\s*[:=\-]?\s*(?P<brand>EBM\s*[- ]?\s*Papst|Ziehl\s*[- ]?\s*Abegg|Standard)\b",
+    re.IGNORECASE,
+)
+PAGE_POSITIVE_TERMS = {
+    "anma gücü": 60, "rated power": 60, "motor data": 35, "fan data": 25,
+    "plug fan": 20, "supply air": 15, "return air": 15, "exhaust air": 15,
+    "nominal rpm": 8, "model / miktar": 8, "fan motor power": 45,
+}
+PAGE_NEGATIVE_TERMS = {
+    "cooling capacity": -25, "heating capacity": -25, "shaft power": -15,
+    "vfd dahil": -12, "vfd hariç": -12, "unit total power": -20, "tot. abs. power": -15,
+}
+
+@dataclass(frozen=True)
+class PageCandidate:
+    page_number: int
+    score: int
+    text: str
+    matched_terms: tuple[str, ...] = ()
+    def to_dict(self): return asdict(self)
+
+@dataclass(frozen=True)
+class MotorPowerResult:
+    page_number: int
+    value_kw: float
+    raw_value: str
+    quantity: str | None
+    field: str
+    confidence: str
+    source_text: str
+    component_type: str | None = None
+    component_role: str | None = None
+    equipment_id: str | None = None
+    model_brand: str | None = None
+    def to_dict(self): return asdict(self)
+
+def _clean(text): return re.sub(r"\s+", " ", text).strip()
+def _ascii(text): return "".join(ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch)).lower()
+def _has_rated_power(text): return bool(RATED_POWER_RE.search(text) or FAN_MOTOR_POWER_RE.search(text) or STANDALONE_MOTOR_POWER_RE.search(text))
+
+def extract_model_brand(text: str) -> str | None:
+    cleaned = _clean(text); match = MODEL_BRAND_RE.search(cleaned)
+    if not match: return None
+    return normalize_motor_brand(match.group("brand"))
+
+def _page_score(text):
+    lowered = _clean(text).lower(); score = 0; matched = []
+    for term, weight in PAGE_POSITIVE_TERMS.items():
+        if term in lowered or _ascii(term) in _ascii(lowered): score += weight; matched.append(f"+{term}")
+    for term, weight in PAGE_NEGATIVE_TERMS.items():
+        if term in lowered or _ascii(term) in _ascii(lowered): score += weight; matched.append(f"{weight}:{term}")
+    if _has_rated_power(lowered): score += 80; matched.append("explicit rated power")
+    return score, tuple(matched)
+
+def discover_motor_power_page(page_texts):
+    return sorted([PageCandidate(i, score, _clean(t), matched) for i, t in enumerate(page_texts, 1) for score, matched in [_page_score(t)]], key=lambda x: (-x.score, x.page_number))
+
+def _normalize_quantity(q): return None if not q else re.sub(r"\s*[x×]\s*", "x", q.strip())
+
+def detect_component_type(text):
+    lowered = _clean(text).lower(); supply = bool(re.search(r"\bsupply\s+air\b", lowered)); ret_air = bool(re.search(r"\breturn\s+air\b", lowered)); exhaust = bool(re.search(r"\bexhaust\s+air\b", lowered)); ret_short = bool(re.search(r"\breturn\b", lowered))
+    if supply and not (ret_air or exhaust): return "Vantilatör", "supply_fan"
+    if exhaust and not supply: return "Aspiratör", "exhaust_fan"
+    if (ret_air or ret_short) and not supply: return "Aspiratör", "return_fan"
+    return None, None
+
+def extract_equipment_id(text):
+    cleaned = _clean(text)
+    ref = re.search(r"(?:unit\s+reference|birim\s+referans[ıi]|unit\s+number|unit\s+no\.?)[\s:#-]*([A-Z0-9]+(?:[-_.][A-Z0-9]+)+|[A-Z]{2,}\s+\d+)\b", cleaned, re.I)
+    if ref:
+        raw = ref.group(1).strip(); compact = re.sub(r"[-_\s]+", "-", raw).upper(); m = re.fullmatch(r"PW-0*(\d+)", compact)
+        return f"PW{int(m.group(1))}" if m else compact
+    for pattern in (r"\bVE\.A\.D\.\d+\b", r"\bAHU\s*[-_ ]?\s*\d+\b"):
+        m = re.search(pattern, cleaned, re.I)
+        if m: return re.sub(r"[-_\s]+", "-", m.group(0)).upper()
+    return None
+
+def _local_context(text, match):
+    cleaned = _clean(text); before = cleaned[:match.start()]; directions = list(re.finditer(r"\b(?:supply|return|exhaust)\s+air\b", before, re.I)); start = directions[-1].start() if directions else max(0, match.start() - 500); after = cleaned[match.end():]; nxt = re.search(r"\b(?:supply|return|exhaust)\s+air\b", after, re.I); end = match.end() + 180 if not nxt else match.end() + nxt.start()
+    if not directions:
+        short_direction = list(re.finditer(r"\b(?:supply|return|exhaust)\b", before, re.I))
+        if short_direction: start = short_direction[-1].start()
+    return cleaned[start:end]
+
+def _rated_power_match_values(match):
+    groups = match.groupdict(); return groups.get("value") or groups.get("tr_value"), groups.get("quantity") or groups.get("tr_quantity"), groups.get("group_count") or groups.get("tr_group_count")
+
+def _result_from_match(text, page_number, match, forced_component=None):
+    cleaned = _clean(text); raw, count, group_count = _rated_power_match_values(match)
+    if not raw: raise ValueError("Motor power regex matched without a power value")
+    quantity = f"{count}x{group_count}" if group_count else _normalize_quantity(count)
+    value = normalize_power(float(raw.replace(",", ".")), "kw"); context = _local_context(cleaned, match); typ, role = forced_component or detect_component_type(context)
+    return MotorPowerResult(page_number, value, raw, quantity, "fan_motor_power", "high" if role else "review", cleaned[max(0, match.start() - 120):min(len(cleaned), match.end() + 120)], typ, role, extract_equipment_id(cleaned), extract_model_brand(cleaned))
+
+def _summary_results(text, page_number):
+    cleaned = _clean(text); brand = extract_model_brand(cleaned); out = []; has_activation = bool(re.search(r"activation\s+fan\s+motor\s+power", cleaned, re.I)); grouped = list(SUMMARY_GROUPED_KW_RE.finditer(cleaned))
+    if has_activation and len(grouped) >= 3:
+        for match, component_type, role in [(grouped[0], "Vantilatör", "supply_fan"), (grouped[1], "Reaktivasyon", "activation_fan"), (grouped[-1], "Aspiratör", "return_fan")]:
+            raw = match.group("value"); out.append(MotorPowerResult(page_number, normalize_power(float(raw.replace(",", ".")), "kw"), raw, _normalize_quantity(match.group("quantity")), "fan_motor_power", "high", match.group(0), component_type, role, extract_equipment_id(cleaned), brand))
+        return out
+    match = SUMMARY_FAN_MOTOR_POWER_RE.search(cleaned)
+    if match:
+        for value_group, quantity_group, component in [("supply_value", "supply_quantity", ("Vantilatör", "supply_fan")), ("return_value", "return_quantity", ("Aspiratör", "return_fan"))]:
+            raw = match.group(value_group); out.append(MotorPowerResult(page_number, normalize_power(float(raw.replace(",", ".")), "kw"), raw, _normalize_quantity(match.group(quantity_group)), "fan_motor_power", "high", match.group(0), component[0], component[1], extract_equipment_id(cleaned), brand))
+    return out
+
+def extract_rated_motor_powers_from_page(text, page_number):
+    try:
+        cleaned = _clean(text); summary = _summary_results(cleaned, page_number)
+        if summary: return summary
+        matches = []
+        for p in (RATED_POWER_RE, FAN_MOTOR_POWER_RE): matches.extend((m.start(), m) for m in p.finditer(cleaned))
+        results = []; seen = set(); brand = extract_model_brand(cleaned)
+        for _, m in sorted(matches, key=lambda x: x[0]):
+            r = replace(_result_from_match(cleaned, page_number, m), model_brand=brand or _result_from_match(cleaned, page_number, m).model_brand)
+            key = (m.start(), r.raw_value, r.quantity, r.component_role)
+            if r.component_role is None or key in seen: continue
+            seen.add(key); results.append(r)
+        if not results and _has_rated_power(cleaned): warning("PDF1 sayfasında kW alanı bulundu fakat fan yönü/equipment belirlenemedi", page=page_number, source_text=cleaned[:500])
+        return results
+    except Exception as exc:
+        exception("PDF1 sayfa motor gücü hesaplama hatası", exc, page=page_number, source_text=_clean(text)[:1000]); raise
+
+def extract_rated_motor_power_from_page(text, page_number):
+    results = extract_rated_motor_powers_from_page(text, page_number)
+    if results: return results[0]
+    cleaned = _clean(text); m = STANDALONE_MOTOR_POWER_RE.search(cleaned)
+    return _result_from_match(cleaned, page_number, m) if m else None
+
+def _canonical_equipment_id(value):
+    if not value: return None
+    value = value.upper().replace("-", "").replace("_", "").replace(" ", "")
+    return re.sub(r"\d+", lambda m: str(int(m.group(0))), value)
+
+def _dedupe_motor_results(results):
+    unique = []; seen = set()
+    for result in results:
+        family = "Vantilatör" if result.component_type == "Vantilatör" else "Aspiratör" if result.component_type == "Aspiratör" else result.component_role
+        key = (_canonical_equipment_id(result.equipment_id), family, result.value_kw, result.quantity)
+        if key in seen: debug("PDF1 motor sonucu tekrarlandı ve atlandı", key=key, page=result.page_number); continue
+        seen.add(key); unique.append(result)
+    return unique
+
+def find_rated_motor_powers_in_pdf(path):
+    from pypdf import PdfReader
+    try:
+        info("PDF1 motor taraması başladı", path=str(path)); reader = PdfReader(str(path)); results = []
+        for page_number, page in enumerate(reader.pages, 1): results.extend(extract_rated_motor_powers_from_page(page.extract_text() or "", page_number))
+        results = _dedupe_motor_results(results); info("PDF1 motor taraması tamamlandı", path=str(path), pages=len(reader.pages), result_count=len(results), results=[x.to_dict() for x in results]); return results
+    except Exception as exc: exception("PDF1 motor taraması başarısız", exc, path=str(path)); raise
+
+def find_rated_motor_power_in_pdf(path):
+    results = find_rated_motor_powers_in_pdf(path); return results[0] if results else None
+
+def build_stage1_motor_records(result, start_index: int = 1):
+    try:
+        if not result.component_type or not result.quantity or not result.equipment_id:
+            warning("PDF1 motor sonucu fiziksel kayda dönüştürülemedi: alan eksik", result=result.to_dict()); return []
+        return expand_motor_group(equipment_id=result.equipment_id, equipment_type="AHU", component_type=result.component_type, group=result.quantity, power_kw=result.value_kw, source_page=result.page_number, start_index=start_index, model_brand=result.model_brand)
+    except Exception as exc:
+        exception("PDF1 fiziksel motor kaydı oluşturma hatası", exc, result=result.to_dict(), start_index=start_index); raise
+
+if __name__ == "__main__":
+    import argparse, json
+    parser = argparse.ArgumentParser(description="Discover fan motor power in a PDF"); parser.add_argument("pdf", help="PDF file"); args = parser.parse_args()
+    print(json.dumps([item.to_dict() for item in find_rated_motor_powers_in_pdf(args.pdf)], ensure_ascii=False, indent=2))
